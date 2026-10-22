@@ -243,6 +243,10 @@ _NP_TITLE_PATTERNS = [
     (re.compile(r'^ing\.?\s+', re.IGNORECASE), 'ing.'),
 ]
 
+# Courtesy titles that are also ordinary words or names ("Sir", "Miss"): taken only when two or
+# more words follow, so "Sir Ahmed" stays a name.
+_NP_COURTESY_TITLES = re.compile(r'^(mr|mrs|ms|miss|sir|dame|rev)\.?\s+', re.IGNORECASE)
+
 _NP_ORG_KEYWORDS = [
     'institute', 'university', 'ministry', 'society', 'department',
     'academy', 'foundation', 'laboratory', 'board', 'commission',
@@ -250,6 +254,21 @@ _NP_ORG_KEYWORDS = [
     'editorial', 'office', 'council', 'committee', 'association',
     'corporation', 'company', 'group', 'center', 'centre',
 ]
+
+# Whole-word nouns that name a body of people (museum, agency, school, society, ministry...) in the
+# languages that dominate the corpus. Matched on accent-folded tokens of names with two or more
+# words, so a surname that happens to equal one of them still parses as a person when alone.
+_NP_ORG_WORDS = frozenset("""
+    museum museo musee museu museums agency agencia agence project projeto proyecto projet
+    collaboration consortium network initiative collaborative hospital clinic clinica klinik
+    school escola escuela college faculty faculdade facultad fakultet fakulti library biblioteca bureau
+    zentrum centro institut instituto istituto institution universidad universidade universite
+    universitat universiteit akademie academia sociedad sociedade societe gesellschaft servicio servico
+    departamento dipartimento abteilung ministere ministerium ministerio ministerie kommission comision
+    comissao programa programme observatory observatorio laboratorio laboratoire laboratories
+    federation authority administration directorate secretariat comite revista zeitschrift editores
+    editors biodiversity natural history research national cancer
+""".split())
 
 # ── Post-nominal credentials ──
 # Curated for OpenAlex's multilingual corpus. nameparser's SUFFIX_ACRONYMS
@@ -292,6 +311,9 @@ _NP_DOTTED_ONLY_CREDS = frozenset(['ms', 'ma', 'mba', 'mfa', 'ba', 'bs'])
 _NP_GENERATIONAL = frozenset(['jr', 'sr', 'ii', 'iii', 'iv', 'v', 'esq'])
 
 _CRED_RE = re.compile(r'(,\s*|\s+)([A-Za-z][A-Za-z.]*\.?)\s*$')
+_NP_GENERATIONAL_RE = re.compile(r'^(?:Jr\.?|Junior|Júnior|Sr\.?|III|IV|II|Esq\.?)$', re.IGNORECASE)
+_NP_GENERATIONAL_TAIL = re.compile(r'\s+(Jr\.?|Sr\.?|III|IV|II|Esq\.?)$', re.IGNORECASE)  # not 'Júnior': that is part of the surname before a comma
+_NP_INITIALS_RUN = re.compile(r'^(?:[A-Za-z]\.){2,}$')  # 'J.D.', 'H.G.G.M.': a person's initials, usually
 
 def _np_acronym_shape(s):
     """Cred-shape heuristic for unknown acronyms (MBA, MFA, FRACP, FAHMS, ...).
@@ -349,9 +371,22 @@ def _np_segment_is_credential(seg_tokens):
     return True
 
 
+def _np_leading_cred_is_name(tok):
+    """'MD', 'MA', 'MS', 'DO' lead a name far more often as an abbreviated given name or as
+    initials ('MD. Ariful Islam', 'MA Bankole') than as a degree. 'RN', 'PhD' and the like
+    stay credentials."""
+    norm = tok.replace('.', '').lower()
+    return norm in _NP_DOTTED_ONLY_CREDS or norm in ('md', 'do')
+
+
 def _np_drop_credential_segments(r):
     """Drop comma segments that are purely credentials; also strip cred tokens
     inside mixed segments (mid-stream) when >=2 name tokens survive.
+
+    Returns ``(name, credentials)``. ``credentials`` are the lowercase, dot-free credentials
+    that trail the whole name ('Markus Meyer, MD, PhD' -> ['md', 'phd']), so the caller can
+    report them as the suffix. Credentials sitting between the surname and the given name
+    ('Davatzikos, PhD, Christos') or inside a segment are dropped without being reported.
 
     Fixes:
       - 'Davatzikos, PhD, Christos'      -> drops PhD segment
@@ -362,11 +397,13 @@ def _np_drop_credential_segments(r):
     Preserves:
       - 'Alam Md. Mahbub'                -> 'Md.' mixed case kept as name
       - 'Dang V Do' / 'Ron Do'           -> 'Do' short + mixed case kept
+      - 'MD. Ariful Islam' / 'MA Bankole' -> a short leading token is a name, not a degree
     """
     if not r:
-        return r
+        return r, []
     segments = [s.strip() for s in r.split(',')]
     kept = []
+    cred_marks = []  # (index in kept after which it was dropped, credentials of that segment)
     for seg in segments:
         if not seg:
             continue
@@ -374,9 +411,16 @@ def _np_drop_credential_segments(r):
         if not tokens:
             continue
         if _np_segment_is_credential(tokens):
+            cred_marks.append((len(kept), [t.replace('.', '').lower() for t in tokens]))
             continue
-        non_cred = [t for t in tokens if not _np_mid_is_credential_token(t)]
-        first_was_cred = _np_mid_is_credential_token(tokens[0])
+        joined = ''.join(tokens).replace('.', '')  # 'Ph. D.' -> 'PhD'
+        if len(tokens) == 2 and len(joined) >= 3 and _np_segment_is_credential([joined]):
+            cred_marks.append((len(kept), [joined.lower()]))
+            continue
+        lead_is_name = _np_leading_cred_is_name(tokens[0]) and len(tokens) >= 2
+        non_cred = [t for i, t in enumerate(tokens)
+                    if not _np_mid_is_credential_token(t) or (i == 0 and lead_is_name)]
+        first_was_cred = _np_mid_is_credential_token(tokens[0]) and not lead_is_name
         if 2 <= len(non_cred) < len(tokens):
             # Standard mid-stream strip — >=2 name tokens survive.
             seg = ' '.join(non_cred)
@@ -386,7 +430,8 @@ def _np_drop_credential_segments(r):
             # creds even if only 1 name token remains.
             seg = ' '.join(non_cred)
         kept.append(seg)
-    return ', '.join(kept)
+    trailing = [c for at, creds in cred_marks if at >= len(kept) for c in creds]
+    return ', '.join(kept), trailing
 
 
 def _np_strip_credentials(r, existing_suffix):
@@ -431,8 +476,13 @@ def _np_strip_credentials(r, existing_suffix):
         )
         # Dotted shape-like tokens of length >=4 (e.g. B.Tech., M.Tech.) count as
         # whitelisted for anchor purposes — internal dots are a strong cred signal.
-        if not is_wl and has_internal_dot and _np_acronym_shape(raw_no_dot) and len(raw_no_dot) >= 4:
+        initials_run = bool(_NP_INITIALS_RUN.match(token))
+        if not is_wl and has_internal_dot and _np_acronym_shape(raw_no_dot) and len(raw_no_dot) >= 4 \
+                and not initials_run:
             is_wl = True
+        if is_wl and initials_run and norm != 'md' \
+                and ' ' not in probe[:m.start()].rstrip(', \t').strip():
+            break  # 'Lawrence, J.D.': stripping it would leave a surname with no given name
         if is_wl:
             # Short (<=2 char) creds need a guard to avoid eating surnames
             # (Ma, Do, Ha, Sa). Exempted when:
@@ -539,6 +589,271 @@ _NP_CHINESE_ROMANIZED_SURNAMES = frozenset([
     'fu', 'zhong', 'kong', 'cui', 'qiu', 'lei', 'yao',
 ])
 
+# ── Pinyin syllables ──
+# Standard Mandarin syllables without tone marks, written out by initial. A token
+# that splits cleanly into one to four of them ("jianling", "shu-hui", "zhibing")
+# reads as romanised Chinese; "bankole" and "nikolai" do not.
+
+_PINYIN_BY_INITIAL = {
+    '': 'a ai an ang ao e ei en eng er o ou',
+    'b': 'a ai an ang ao ei en eng i ian iao ie in ing o u',
+    'p': 'a ai an ang ao ei en eng i ian iao ie in ing o ou u',
+    'm': 'a ai an ang ao e ei en eng i ian iao ie in ing iu o ou u',
+    'f': 'a an ang ei en eng o ou u',
+    'd': 'a ai an ang ao e ei en eng i ia ian iao ie ing iu ong ou u uan ui un uo',
+    't': 'a ai an ang ao e eng i ian iao ie ing ong ou u uan ui un uo',
+    'n': 'a ai an ang ao e ei en eng i ian iang iao ie in ing iu ong ou u uan uo v ve',
+    'l': 'a ai an ang ao e ei eng i ia ian iang iao ie in ing iu ong ou u uan un uo v ve',
+    'g': 'a ai an ang ao e ei en eng ong ou u ua uai uan uang ui un uo',
+    'k': 'a ai an ang ao e en eng ong ou u ua uai uan uang ui un uo',
+    'h': 'a ai an ang ao e ei en eng ong ou u ua uai uan uang ui un uo',
+    'j': 'i ia ian iang iao ie in ing iong iu u uan ue un',
+    'q': 'i ia ian iang iao ie in ing iong iu u uan ue un',
+    'x': 'i ia ian iang iao ie in ing iong iu u uan ue un',
+    'zh': 'a ai an ang ao e ei en eng i ong ou u ua uai uan uang ui un uo',
+    'ch': 'a ai an ang ao e en eng i ong ou u ua uai uan uang ui un uo',
+    'sh': 'a ai an ang ao e ei en eng i ou u ua uai uan uang ui un uo',
+    'r': 'an ang ao e en eng i ong ou u uan ui un uo',
+    'z': 'a ai an ang ao e ei en eng i ong ou u uan ui un uo',
+    'c': 'a ai an ang ao e en eng i ong ou u uan ui un uo',
+    's': 'a ai an ang ao e en eng i ong ou u uan ui un uo',
+    'y': 'a an ang ao e i in ing ong ou u uan ue un',
+    'w': 'a ai an ang ei en eng o u',
+}
+_NP_PINYIN_SYLLABLES = frozenset(
+    initial + final for initial, finals in _PINYIN_BY_INITIAL.items() for final in finals.split()
+)
+_NP_PINYIN_MAX_SYLLABLES = 4
+_PINYIN_GIVEN_GUARD = 5.0  # "Lu Anna": a clearly Western given name that happens to spell pinyin
+
+def _np_pinyin_segmentable(token):
+    """True when ``token`` splits into 1-4 pinyin syllables (hyphens and apostrophes are free breaks)."""
+    word = re.sub(r"[-'\s]", '', token.lower())
+    if not word.isalpha() or not word.isascii():
+        return False
+    # best[i] = fewest syllables that spell word[:i]
+    best = [0] + [99] * len(word)
+    for i in range(1, len(word) + 1):
+        for j in range(max(0, i - 6), i):
+            if best[j] < 99 and word[j:i] in _NP_PINYIN_SYLLABLES:
+                best[i] = min(best[i], best[j] + 1)
+    return best[-1] <= _NP_PINYIN_MAX_SYLLABLES
+
+# ── Name-order inference ──
+# ``name_order="auto"`` weighs how given-name-like and surname-like each token
+# looks. The evidence is only loaded on first use. See scripts/build_name_evidence.py.
+
+_NAME_ORDERS = ("first_last", "last_first", "auto")
+_AUTO_MARGIN = 3.0         # evidence (nats) required to read "Last First" from the lexicon alone
+_AUTO_INITIAL_GUARD = 1.0  # "Word J": stay "First Last" if Word is at least this given-name-like
+_AUTO_CONFIDENT = 1.0      # evidence in favour of "First Last" needed to report 'high'
+_NP_INITIAL_TOKEN = re.compile(r'^[A-Za-z]\.?$')
+_evidence_cache = None
+
+def _name_evidence():
+    """Return ``(scores, pinyin_surnames)``. ``scores`` maps a lowercase ASCII
+    token to a number that is positive when the token is mostly a given name and
+    negative when it is mostly a surname; unknown tokens score 0."""
+    global _evidence_cache
+    if _evidence_cache is None:
+        with resources.files(__package__).joinpath("data", "name_evidence.json").open(encoding="utf-8") as f:
+            data = json.load(f)
+        scale = data["scale"]
+        scores = {}
+        for level, tokens in data["levels"].items():
+            value = int(level) / scale
+            for token in tokens.split():
+                scores[token] = value
+        _evidence_cache = (scores, frozenset(data["pinyin_surnames"]))
+    return _evidence_cache
+
+def _evidence_key(token):
+    cleaned = _np_clean(token)
+    return re.sub(r'[^a-z]', '', cleaned.lower()) if cleaned else ''
+
+def _auto_order(t0, t1):
+    """Decide the order of two name tokens.
+
+    Returns ``(swap, confident)``. ``swap`` is True when they read as "Last First".
+    Flips are deliberately conservative: a wrong flip costs a name that was
+    already right, so weak evidence keeps the default order and is reported as
+    ``confident=False`` instead.
+    """
+    scores, pinyin = _name_evidence()
+    a, b = _evidence_key(t0), _evidence_key(t1)
+    if a in _NP_CHINESE_ROMANIZED_SURNAMES or a in _NP_KOREAN_ROMANIZED_SURNAMES \
+            or b in _NP_CHINESE_ROMANIZED_SURNAMES or b in _NP_KOREAN_ROMANIZED_SURNAMES:
+        return False, False  # the CJK rules above own these; they declined, so stay ambiguous
+    t0_initial, t1_initial = bool(_NP_INITIAL_TOKEN.match(t0)), bool(_NP_INITIAL_TOKEN.match(t1))
+    if t0_initial and not t1_initial:
+        return False, True   # "J. Priem"
+    if t1_initial and not t0_initial and len(a) >= 2:
+        # "Priem J.": a lone letter is almost never a surname. The exception is
+        # the South Indian "Given S" style, so keep given-name-like words as they are.
+        if scores.get(a, 0.0) < _AUTO_INITIAL_GUARD:
+            return True, False
+        return False, False
+    if len(a) < 2 or len(b) < 2:
+        return False, False
+    if len(t0) >= 3 and t0.isupper() and not t1.isupper():
+        return True, False   # "PRIEM Jason": the upper-cased surname convention
+    if (a in pinyin) != (b in pinyin):
+        return a in pinyin, False
+    margin = scores.get(b, 0.0) - scores.get(a, 0.0)
+    if margin > _AUTO_MARGIN:
+        return True, False
+    return False, -margin >= _AUTO_CONFIDENT
+
+_CAPS_INITIALS = re.compile(r'^[A-Z]{2,3}$')
+
+def _np_split_caps_initials(tokens):
+    """"NF Bevis" -> ["N", "F", "Bevis"]: a run of two or three capitals in front of a
+    mixed-case word is a person's initials, run together (the PubMed style), not a word."""
+    if len(tokens) < 2 or len(tokens) > 5 or not _CAPS_INITIALS.match(tokens[0]):
+        return tokens
+    if all(t.isupper() for t in tokens):
+        return tokens  # shouting: "NF BEVIS" carries no case evidence
+    rest = tokens[1:]
+    if any(t.isupper() and len(t) > 1 for t in rest):
+        return tokens
+    head = _evidence_key(tokens[0])
+    scores, pinyin = _name_evidence()
+    if head in pinyin or head in _NP_CHINESE_ROMANIZED_SURNAMES or head in _NP_KOREAN_ROMANIZED_SURNAMES:
+        # "MA Bankole" are initials; "MA Youzhi" is a Chinese name written surname-first
+        if len(rest) == 1 and _np_pinyin_segmentable(rest[0]) and scores.get(_evidence_key(rest[0]), 0.0) < _PINYIN_GIVEN_GUARD:
+            return tokens
+    return list(tokens[0]) + rest
+
+def _np_auto_reorder_with_initials(tokens):
+    """Return ``(first, middle, last)`` when ``tokens`` read "Surname Given [initials]", else None."""
+    t0 = tokens[0]
+    if len(_evidence_key(t0)) < 2 or _NP_INITIAL_TOKEN.match(t0) or t0.lower() in _NP_COMPOUND_PREFIXES:
+        return None
+    scores = _name_evidence()[0]
+    rest = tokens[1:]
+    dotted = [bool(re.fullmatch(r'[A-Z]\.', t)) for t in rest]
+    if len(rest) >= 2 and all(dotted):
+        # "Klimanov V. V.": every later token is a dotted initial
+        if scores.get(_evidence_key(t0), 0.0) < _AUTO_INITIAL_GUARD:
+            return rest[0], ' '.join(rest[1:]), t0
+        return None
+    if len(tokens) == 3 and _NP_INITIAL_TOKEN.match(tokens[2]) and not _NP_INITIAL_TOKEN.match(tokens[1]):
+        # "Smith John P.": judge the two words like a plain two-token name
+        if _auto_order(t0, tokens[1])[0]:
+            return tokens[1], tokens[2], t0
+    return None
+
+# ── List-level order inference ──
+# Authors of one paper or one record usually share a convention, so the names
+# of a list vote together. Each name contributes a signed number: positive when
+# it reads "Last First", negative when it reads "First Last", zero when it has
+# no opinion. A list is read "Last First" only when the weight of that
+# evidence clearly outweighs the opposite, which keeps correctly ordered lists
+# on the default parse.
+
+_LIST_VOTE_CLIP = 4.0   # one name never counts for more than this
+_LIST_VOTE_CJK = 2.0    # a CJK-family surname next to a non-surname
+_LIST_MARGIN = 4.0      # net evidence needed before a list is read "Last First"
+
+# ── Compound (double) surnames ──
+# "Maria Garcia Lopez", "Juan Carlos Perez Gomez": two surname-like tokens at the
+# end of a name usually form one surname. Decided from the lexicon scores of the
+# last three tokens; the cut-offs were chosen on half of the gold set and checked
+# on the other half.
+
+_BIN_STRONG = 2.0   # at least this given-name-like: 'G'
+_BIN_SURNAME = -3.0  # at most this surname-like: 'S'
+
+def _score_bin(token):
+    score = _name_evidence()[0].get(_evidence_key(token), 0.0)
+    if score >= _BIN_STRONG:
+        return 'G'
+    if score > 0:
+        return 'g'
+    if score == 0:
+        return '0'
+    return 's' if score > _BIN_SURNAME else 'S'
+
+def _np_has_double_surname(tokens):
+    """True when the last two of ``tokens`` read as one compound surname."""
+    if len(tokens) < 3:
+        return False
+    tail = tokens[-3:]
+    if len(tokens[0].rstrip('.')) < 2:
+        return False
+    for tok in tail:
+        plain = _np_clean(tok)
+        if not plain or len(plain) < 3 or not re.fullmatch(r"[a-z]+(?:[-'][a-z]+)*", plain):
+            return False
+    if any(t.lower().rstrip('.') in _NP_COMPOUND_PREFIXES for t in tokens):
+        return False
+    before, penult, final = (_score_bin(t) for t in tail)
+    if len(tokens) > 3:
+        # "Maria Isabel Garcia Lopez": the token before the pair must be given-name-like too
+        if _score_bin(tokens[0]) != 'G' or before != 'G':
+            return False
+        return (penult == 'S' and final in 'Ss0g') or (penult in '0s' and final == 'S')
+    if penult != 'S':
+        return False
+    # "Maria Garcia Lopez": a given-name-like first token, or an unknown one when the last is a clear surname
+    if final == 'S' and before in 'G0s':
+        return True
+    # Accents point to Iberian naming, where a second surname is the norm.
+    return not ''.join(tokens).isascii() and before == 'G' and final in 'Ss0g'
+
+def _order_signal(raw):
+    if ',' in raw or not raw.isascii():
+        return 0.0
+    tokens = raw.split()
+    if len(tokens) < 2 or len(tokens) > 3:
+        return 0.0
+    if len(tokens) == 3 and not _NP_INITIAL_TOKEN.match(tokens[1]):
+        return 0.0  # "Anna Maria Rossi": too ambiguous to vote
+    t0, t1 = tokens[0], tokens[-1]
+    scores, pinyin = _name_evidence()
+    a, b = _evidence_key(t0), _evidence_key(t1)
+    cjk_surnames = _NP_CHINESE_ROMANIZED_SURNAMES | _NP_KOREAN_ROMANIZED_SURNAMES | pinyin
+    a_cjk, b_cjk = a in cjk_surnames, b in cjk_surnames
+    if a_cjk != b_cjk and len(a) >= 2 and len(b) >= 2 and not (t0.isupper() and t1.isupper()):
+        return _LIST_VOTE_CJK if a_cjk else -_LIST_VOTE_CJK
+    if a_cjk and b_cjk:
+        return 0.0
+    t0_initial, t1_initial = bool(_NP_INITIAL_TOKEN.match(t0)), bool(_NP_INITIAL_TOKEN.match(t1))
+    if t0_initial and not t1_initial:
+        return -_LIST_VOTE_CLIP
+    if t1_initial and not t0_initial and len(a) >= 2:
+        return 2.0 if scores.get(a, 0.0) < _AUTO_INITIAL_GUARD else -1.0
+    if len(a) < 2 or len(b) < 2:
+        return 0.0
+    if len(t0) >= 3 and t0.isupper() and not t1.isupper():
+        return 2.0
+    return max(-_LIST_VOTE_CLIP, min(_LIST_VOTE_CLIP, scores.get(b, 0.0) - scores.get(a, 0.0)))
+
+def infer_name_order(names):
+    """Return ``"first_last"`` or ``"last_first"`` for a list of names that share a convention.
+
+    The default is ``"first_last"``; the list is read ``"last_first"`` only when
+    its names, taken together, lean clearly that way.
+    """
+    signals = [_order_signal(n) for n in names if n]
+    last_first = sum(s for s in signals if s > 0)
+    first_last = -sum(s for s in signals if s < 0)
+    return 'last_first' if last_first - first_last > _LIST_MARGIN else 'first_last'
+
+def parse_names(names, name_order='auto'):
+    """Parse the names of one record (e.g. one paper's authors).
+
+    ``name_order="auto"`` infers one order for the whole list with
+    :func:`infer_name_order`, so a list written "First Last" parses exactly like
+    :func:`parse_name`, and a list written "Last First" is read consistently.
+    ``"first_last"`` and ``"last_first"`` are applied to every name.
+    """
+    names = list(names)
+    if name_order not in _NAME_ORDERS:
+        raise ValueError(f"name_order must be one of {_NAME_ORDERS}, got {name_order!r}")
+    order = infer_name_order(names) if name_order == 'auto' else name_order
+    return [_np_parse_name(n, name_order=order) for n in names]
+
 # ── Cyrillic patronymic endings ──
 
 _NP_PATRONYMIC_ENDINGS = (
@@ -547,6 +862,47 @@ _NP_PATRONYMIC_ENDINGS = (
 )
 
 # ── Output helper ──
+
+_GLUE_BOUNDARY = re.compile(r'(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])')
+_GLUE_PREFIXES = frozenset(['mc', 'mac', 'de', 'di', 'da', 'del', 'la', 'le', 'van', 'von', 'o', 'd', 'st',
+                            'al', 'el', 'ben', 'bin', 'ter', 'ten', 'der', 'den', 'du', 'dos', 'das'])
+
+
+def _np_split_glued(token):
+    """Split a single glued token ("YuanWang", "GuoxingZHANG", "SungKunKim").
+
+    Returns ``(first, middle, last)`` or None. Only a camel-case or lower-to-CAPS
+    boundary is used, never a guess inside a lowercase run, and the two-word case
+    needs a clear pinyin surname at the end."""
+    if not (token.isascii() and token.isalpha()):
+        return None
+    parts = _GLUE_BOUNDARY.split(token)
+    if not 2 <= len(parts) <= 3 or any(len(p) < 2 for p in parts):
+        return None
+    if parts[0].lower() in _GLUE_PREFIXES:
+        return None
+    keys = [p.lower() for p in parts]
+    if len(parts) == 2:
+        a, b = parts
+        if b.isupper() and not a.isupper():
+            return a, None, b
+        if a.isupper() or b.isupper():
+            return None
+        scores = _name_evidence()[0]
+        sa, sb = scores.get(keys[0], 0.0), scores.get(keys[1], 0.0)
+        # Only the pinyin case is decisive: a clear surname closing a pinyin-shaped word.
+        # Western pairs ("LightMart", "VojnovicMilan") are left whole; no word list can
+        # tell a brand from a name, and a split that is wrong costs more than none.
+        if keys[1] in _NP_CHINESE_ROMANIZED_SURNAMES and sb <= -2.0 and sa - sb >= 3.0 \
+                and keys[0] not in _NP_KOREAN_ROMANIZED_SURNAMES and _np_pinyin_segmentable(keys[0]):
+            return a, None, b
+        return None
+    if any(p.isupper() for p in parts):
+        return None
+    if keys[2] in _NP_KOREAN_ROMANIZED_SURNAMES and keys[1] not in _NP_KOREAN_ROMANIZED_SURNAMES:
+        return parts[0], parts[1], parts[2]
+    return None
+
 
 def _np_out(title=None, first=None, middle=None, last=None, suffix=None,
             nickname=None, confidence='high'):
@@ -725,7 +1081,18 @@ def _np_parse_arabic(raw):
 
 # ── Latin parser ──
 
-def _np_parse_latin(name):
+def _np_is_author_list(segs):
+    """True when comma segments read as several people ("Verena Menz, Mona Semsch, Florian
+    Mosbach") rather than "Surname, Given, extra". Needs three or more multi-word segments, and a
+    first segment that does not start with a surname particle ("Van Der Berg, Jan, Antwerp")."""
+    head = segs[:3]
+    if len(head) < 3 or not all(len(seg.split()) >= 2 for seg in head):
+        return False
+    return segs[0].split()[0].lower().rstrip('.') not in _NP_COMPOUND_PREFIXES
+
+
+
+def _np_parse_latin(name, name_order='first_last'):
     r = name.strip()
     r = re.sub(r'\s+\d{4}-\s*$', '', r)
     r = re.sub(r';\s*id_orcid\s+[\d-]+', '', r)
@@ -740,26 +1107,39 @@ def _np_parse_latin(name):
     r = re.sub(r'^\s*-\s*', '', r)
     r = re.sub(r'\s+', ' ', r).strip()
 
+    # Affiliations in brackets ("Kulesza, Joel A. [Los Alamos National Laboratory]") are not part
+    # of the name, and neither are life dates ("Huber, Kaspar (1825 - 1882), Kupferstecher").
+    r = re.sub(r'\s*\[[^\]]*\]', '', r)
+    r, _life_dates = re.subn(r'\s*\(\s*\d{3,4}\s*-\s*\d{0,4}\s*\)', '', r)
+
+    # "First Last; First Last; ..." keeps the first author. Done before the organisation test
+    # so an affiliation riding along in a later part cannot turn a person into an organisation.
+    if ';' in r:
+        parts = r.split(';')
+        if len(parts) >= 2 and len(parts[0].strip().split()) >= 2 and len(parts[1].strip().split()) >= 2:
+            r = parts[0].strip()
+
     # Drop comma segments that are pure credentials + mid-stream cred tokens
     # before any first/last role assignment.
-    r = _np_drop_credential_segments(r)
+    r, _segment_creds = _np_drop_credential_segments(r)
 
     # Strip credentials BEFORE the dot-split, so trailing 'M.D.' / 'Ph.D.' /
     # 'M.S.' tokens are matched in compact form (the dot-split below would
     # otherwise turn 'M.D.' into 'M. D.' which the strip can't reassemble).
     r, _early_cred_suffix = _np_strip_credentials(r, None)
+    if _segment_creds:
+        _early_cred_suffix = ', '.join(([_early_cred_suffix] if _early_cred_suffix else []) + _segment_creds)
 
     r = re.sub(r'\.([A-Z])', r'. \1', r)
 
-    r_lower = r.lower()
-    for kw in _NP_ORG_KEYWORDS:
-        if kw in r_lower:
-            return _np_out(last=_np_clean(r))
+    # Bracketed text ("(Guest Editors)", "(IJMACR)") says nothing about whether the rest is a person.
+    r_org = re.sub(r'\s+', ' ', re.sub(r'\([^)]*\)|\[[^\]]*\]', ' ', r)).strip()
+    r_lower = r_org.lower()
+    if any(kw in r_lower for kw in _NP_ORG_KEYWORDS) or (
+            len(r_org.split()) >= 2
+            and any(w in _NP_ORG_WORDS for w in re.findall(r'[a-z]+', _np_to_ascii(r_lower)))):
+        return _np_out(last=_np_clean(r_org))
 
-    if ';' in r:
-        parts = r.split(';')
-        if len(parts) >= 2 and len(parts[0].strip().split()) >= 2 and len(parts[1].strip().split()) >= 2:
-            r = parts[0].strip()
     et_al_match = re.search(r'\bet\s+al\.?\s*$', r, re.IGNORECASE)
     if et_al_match:
         r = r[:et_al_match.start()].strip()
@@ -780,6 +1160,11 @@ def _np_parse_latin(name):
             title = title_val
             r = r[m.end():].strip()
             break
+    else:
+        m = _NP_COURTESY_TITLES.match(r)
+        if m and len(r[m.end():].split()) >= 2:
+            title = m.group(1).lower() + '.'
+            r = r[m.end():].strip()
 
     suffix = None
     suffix_match = re.search(r',?\s+(Jr\.?|Junior|Júnior|Sr\.?|III|IV|II|Esq\.?)$', r, re.IGNORECASE)
@@ -801,26 +1186,60 @@ def _np_parse_latin(name):
             suffix = f"{gen}, {suffix}" if suffix else gen
 
     if ',' in r:
-        parts = r.split(',', 1)
-        last_part = parts[0].strip()
-        first_part = parts[1].strip()
-        if first_part:
+        segs = [seg.strip() for seg in r.split(',') if seg.strip()]
+        if len(segs) >= 3 and _NP_GENERATIONAL_RE.match(segs[1]):
+            # "Farrell, Jr., Robert E": the generation marker sits between surname and given name.
+            gen = _np_clean(segs.pop(1))
+            suffix = f"{gen}, {suffix}" if suffix else gen
+        elif len(segs) >= 2:
+            tail = _NP_GENERATIONAL_TAIL.search(segs[0])
+            if tail and len(segs[0].split()) >= 2:
+                # "Knodler Jr, Michael"
+                gen = _np_clean(tail.group(1))
+                suffix = f"{gen}, {suffix}" if suffix else gen
+                segs[0] = segs[0][:tail.start()].strip()
+        if len(segs) >= 3 and _np_is_author_list(segs):
+            r = segs[0]  # several people in one string: parse the first
+        elif len(segs) >= 2:
+            last_part = segs[0]
+            first_part = segs[1] if _life_dates else ', '.join(segs[1:])
             ftokens = first_part.split()
             first = _np_clean(ftokens[0])
             middle = _np_clean(' '.join(ftokens[1:])) if len(ftokens) > 1 else None
+            return _np_out(title=title, first=first, middle=middle, last=_np_clean(last_part),
+                           suffix=suffix, nickname=nickname, confidence='high')
         else:
-            first, middle = None, None
-        return _np_out(title=title, first=first, middle=middle, last=_np_clean(last_part),
-                       suffix=suffix, nickname=nickname, confidence='high')
+            r = segs[0] if segs else ''
 
     r = re.sub(r'\b([A-Z])\.-([A-Z])\.', r'\1. \2.', r)
+    r = re.sub(r'^([A-Z])(\.?)-([A-Z])\b(\.?)(?=\s)', r'\1\2 \3\4', r)
     tokens = r.split()
 
     if len(tokens) == 0:
         return _np_out(last=_np_clean(r), suffix=suffix, nickname=nickname)
     if len(tokens) == 1:
+        glued = _np_split_glued(tokens[0])
+        if glued:
+            return _np_out(title=title, first=_np_clean(glued[0]),
+                           middle=_np_clean(glued[1]) if glued[1] else None,
+                           last=_np_clean(glued[2]), suffix=suffix, nickname=nickname,
+                           confidence='medium')
         return _np_out(title=title, last=_np_clean(tokens[0]), suffix=suffix,
                        nickname=nickname, confidence='high')
+
+    tokens = _np_split_caps_initials(tokens)
+
+    if name_order == 'last_first':
+        # The caller says the surname leads ("Priem Jason R."): no guessing, and a
+        # leading compound surname ("van der Berg Jan") stays together.
+        i = 0
+        while i < len(tokens) - 2 and tokens[i].lower().rstrip('.') in _NP_COMPOUND_PREFIXES:
+            i += 1
+        rest = tokens[i + 1:]
+        return _np_out(title=title, first=_np_clean(rest[0]),
+                       middle=_np_clean(' '.join(rest[1:])) if len(rest) > 1 else None,
+                       last=_np_clean(' '.join(tokens[:i + 1])), suffix=suffix, nickname=nickname,
+                       confidence='high')
 
     if len(tokens) == 2:
         t0_lower = tokens[0].lower().rstrip('.')
@@ -840,8 +1259,47 @@ def _np_parse_latin(name):
         if t1_lower in _NP_CHINESE_ROMANIZED_SURNAMES and t0_lower not in _NP_CHINESE_ROMANIZED_SURNAMES:
             return _np_out(title=title, first=_np_clean(tokens[0]), last=_np_clean(tokens[1]),
                            suffix=suffix, nickname=nickname, confidence='high')
+        # Short pinyin surnames that double as ordinary words ("Lu", "He", "Wu", "Ou") are left out of
+        # the set above, but "LU Qing" is still surname-first: the second token spells pinyin
+        # syllables and is not a surname itself, while the first one is.
+        a_key, b_key = _evidence_key(tokens[0]), _evidence_key(tokens[1])
+        if (a_key in _name_evidence()[1] and b_key not in _name_evidence()[1] and len(b_key) >= 2
+                and a_key not in _NP_KOREAN_ROMANIZED_SURNAMES and b_key not in _NP_KOREAN_ROMANIZED_SURNAMES
+                and _name_evidence()[0].get(b_key, 0.0) < _PINYIN_GIVEN_GUARD
+                and _np_pinyin_segmentable(tokens[1])):
+            return _np_out(title=title, first=_np_clean(tokens[1]), last=_np_clean(tokens[0]),
+                           suffix=suffix, nickname=nickname, confidence='medium')
+        if name_order == 'auto':
+            # Without a comma the order is a guess. Flipped parses are inferences,
+            # so they are never 'high'; neither is a parse with no evidence behind it.
+            swap, confident = _auto_order(tokens[0], tokens[1])
+            if swap:
+                return _np_out(title=title, first=_np_clean(tokens[1]), last=_np_clean(tokens[0]),
+                               suffix=suffix, nickname=nickname, confidence='medium')
+            return _np_out(title=title, first=_np_clean(tokens[0]), last=_np_clean(tokens[1]),
+                           suffix=suffix, nickname=nickname, confidence='high' if confident else 'medium')
         return _np_out(title=title, first=_np_clean(tokens[0]), last=_np_clean(tokens[1]),
                        suffix=suffix, nickname=nickname, confidence='high')
+
+    if name_order == 'auto' and len(tokens) >= 3:
+        # "Klimanov V. V." / "Smith John P.": a surname followed by given names and initials.
+        reordered = _np_auto_reorder_with_initials(tokens)
+        if reordered:
+            first, middle, last = reordered
+            return _np_out(title=title, first=_np_clean(first), middle=_np_clean(middle) if middle else None,
+                           last=_np_clean(last), suffix=suffix, nickname=nickname, confidence='medium')
+
+    # "Dharunraja S R": South Indian style, where the surname is itself initials. Two or more
+    # bare capitals at the end, after a real word, read as one surname.
+    run = 0
+    while run < len(tokens) - 1 and re.fullmatch(r'[A-Z]', tokens[-1 - run]):
+        run += 1
+    if run >= 2 and len(tokens[-run - 1].rstrip('.')) >= 2 and tokens[-run - 1].lower() not in _NP_COMPOUND_PREFIXES:
+        head = tokens[:-run]
+        return _np_out(title=title, first=_np_clean(head[0]),
+                       middle=_np_clean(' '.join(head[1:])) if len(head) > 1 else None,
+                       last=_np_clean(' '.join(tokens[-run:])), suffix=suffix, nickname=nickname,
+                       confidence='medium')
 
     surname_start = len(tokens) - 1
     found_prefix = False
@@ -856,6 +1314,8 @@ def _np_parse_latin(name):
         else:
             break
 
+    if surname_start == len(tokens) - 1 and _np_has_double_surname(tokens):
+        surname_start -= 1
     conf = 'high' if found_prefix else 'medium'
     first = _np_clean(tokens[0])
     if surname_start == 1:
@@ -868,8 +1328,10 @@ def _np_parse_latin(name):
 
 # ── Main entry point ──
 
-def _np_parse_name(raw_author_name):
+def _np_parse_name(raw_author_name, name_order='first_last'):
     """New deterministic parser. Returns dict with confidence field."""
+    if name_order not in _NAME_ORDERS:
+        raise ValueError(f"name_order must be one of {_NAME_ORDERS}, got {name_order!r}")
     if not raw_author_name or not raw_author_name.strip():
         return _np_out()
     r = raw_author_name.strip()
@@ -914,7 +1376,7 @@ def _np_parse_name(raw_author_name):
             return _np_parse_latin(latin_part)
         return _np_out(confidence='low')
 
-    return _np_parse_latin(r)
+    return _np_parse_latin(r, name_order=name_order)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
